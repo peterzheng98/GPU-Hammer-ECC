@@ -1,0 +1,36 @@
+# Build artifacts
+gpu_hammer
+*.o
+*.d
+*.obj
+*.exp
+*.lib
+*.pdb
+
+# CUDA intermediate files
+*.cubin
+*.fatbin
+*.ptx
+*.gpu
+*.i
+*.ii
+*.cu.cpp
+
+# Editor / IDE
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs and output
+*.log
+*.csv
+*.json
+*.prof
+
+# OS
+Thumbs.db
+desktop.ini
