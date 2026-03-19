@@ -745,7 +745,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    bool is_hbm = strstr(prop.name, "A100") || strstr(prop.name, "H100") ||
+    bool is_hbm = strstr(prop.name, "A100") || strstr(prop.name, "H100") || strstr(prop.name, "H800") ||
                   strstr(prop.name, "H200") || strstr(prop.name, "B100") ||
                   strstr(prop.name, "B200") || strstr(prop.name, "GH200");
     printf("  Type:     %s (heuristic)\n", is_hbm ? "HBM" : "GDDR");
