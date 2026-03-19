@@ -278,23 +278,6 @@ __global__ void kern_fill(uint8_t *mem, size_t n, uint8_t val) {
     for (; i < n; i += s) mem[i] = val;
 }
 
-// Check memory against expected pattern, count mismatches
-__global__ void kern_check(const uint8_t *mem, size_t n, uint8_t expect,
-                           unsigned long long *cnt,
-                           unsigned long long *first_off,
-                           uint8_t *first_got) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t s = (size_t)blockDim.x * gridDim.x;
-    for (; i < n; i += s) {
-        if (mem[i] != expect) {
-            atomicAdd(cnt, 1ULL);
-            unsigned long long prev = atomicMin(first_off, (unsigned long long)i);
-            if ((unsigned long long)i < prev)
-                *first_got = mem[i];
-        }
-    }
-}
-
 // k-warp, m-thread-per-warp synchronized Rowhammer kernel.
 // Each active thread hammers one aggressor address.
 // Delay loops after each round create memory controller bubbles
@@ -350,42 +333,6 @@ static void gpu_fill(uint8_t *d, size_t n, uint8_t v) {
     int blk = (int)std::min((size_t)65535, (n + thr - 1) / thr);
     kern_fill<<<blk, thr>>>(d, n, v);
     CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-struct FlipResult { int count; size_t offset; uint8_t expected; uint8_t got; };
-
-static FlipResult gpu_check(const uint8_t *d, size_t n, uint8_t expect) {
-    unsigned long long *d_cnt, *d_first;
-    uint8_t *d_got;
-    CUDA_CHECK(cudaMalloc(&d_cnt, 8));
-    CUDA_CHECK(cudaMalloc(&d_first, 8));
-    CUDA_CHECK(cudaMalloc(&d_got, 1));
-    unsigned long long z = 0, mx = ULLONG_MAX;
-    uint8_t gz = 0;
-    CUDA_CHECK(cudaMemcpy(d_cnt, &z, 8, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_first, &mx, 8, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_got, &gz, 1, cudaMemcpyHostToDevice));
-
-    int thr = 256;
-    int blk = (int)std::min((size_t)65535, (n + thr - 1) / thr);
-    kern_check<<<blk, thr>>>(d, n, expect, d_cnt, d_first, d_got);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    unsigned long long h_cnt, h_first;
-    uint8_t h_got;
-    CUDA_CHECK(cudaMemcpy(&h_cnt, d_cnt, 8, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&h_first, d_first, 8, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(&h_got, d_got, 1, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_cnt));
-    CUDA_CHECK(cudaFree(d_first));
-    CUDA_CHECK(cudaFree(d_got));
-
-    FlipResult r{};
-    r.count = (int)h_cnt;
-    r.offset = (size_t)h_first;
-    r.expected = expect;
-    r.got = h_got;
-    return r;
 }
 
 // ===================================================================
@@ -684,57 +631,59 @@ static void run_campaign(
                 stats.ecc_events++;
             }
 
-            // Check victim data between each pair of adjacent aggressors
-            for (int i = 0; i < n_sided - 1; i++) {
-                size_t vs = agg_offs[i] + 256;
-                size_t ve = agg_offs[i + 1];
-                if (ve <= vs || ve - vs > mem_sz) continue;
+            // Check victim rows: only rows in THIS bank adjacent to
+            // aggressors (±3 rows), where actual Rowhammer flips occur.
+            // The old approach checked the entire raw memory region between
+            // aggressors, which contained other banks' data and stale
+            // aggressor patterns from previous iterations.
+            {
+                int first_ri = pos;
+                int last_ri = pos + (n_sided - 1) * distance;
+                int check_lo = std::max(0, first_ri - 3);
+                int check_hi = std::min(nrows - 1, last_ri + 3);
+                uint8_t buf[256];
 
-                FlipResult fr = gpu_check(d_mem + vs, ve - vs, victim_pat);
-                if (fr.count > 0) {
-                    stats.bitflips += fr.count;
-                    size_t abs_off = vs + fr.offset;
-                    printf("\n  !!!! BIT FLIP – bank %d pos %d !!!!\n", bi, pos);
-                    printf("  Offset: 0x%lx  Expected: 0x%02X  Got: 0x%02X  "
-                           "XOR: 0x%02X  Count: %d\n",
-                           (unsigned long)abs_off, fr.expected, fr.got,
-                           fr.expected ^ fr.got, fr.count);
-                    // Restore for subsequent tests
-                    gpu_fill(d_mem + vs, ve - vs, victim_pat);
+                for (int vi = check_lo; vi <= check_hi; vi++) {
+                    // Skip aggressor rows
+                    int diff = vi - pos;
+                    if (diff >= 0 && diff <= (n_sided - 1) * distance
+                        && diff % distance == 0)
+                        continue;
+
+                    size_t voff = bk.rows[vi];
+                    if (voff + 256 > mem_sz) continue;
+
+                    CUDA_CHECK(cudaMemcpy(buf, d_mem + voff, 256,
+                                          cudaMemcpyDeviceToHost));
+                    for (int b = 0; b < 256; b++) {
+                        if (buf[b] != victim_pat) {
+                            stats.bitflips++;
+                            int nearest_agg = pos
+                                + ((vi - pos + distance / 2) / distance)
+                                  * distance;
+                            printf("\n  !!!! BIT FLIP – bank %d "
+                                   "victim row %d (near aggressor row %d)"
+                                   " !!!!\n", bi, vi, nearest_agg);
+                            printf("  Offset: 0x%lx  byte %d: "
+                                   "expected 0x%02X got 0x%02X "
+                                   "(XOR 0x%02X)\n",
+                                   (unsigned long)(voff + b), b,
+                                   victim_pat, buf[b],
+                                   victim_pat ^ buf[b]);
+                            // Restore this victim row
+                            CUDA_CHECK(cudaMemset(d_mem + voff,
+                                                  victim_pat, 256));
+                            break;
+                        }
+                    }
                 }
             }
 
-            // Also check the row just before the first aggressor
-            if (agg_offs[0] >= 256) {
-                size_t vs = agg_offs[0] - 256;
-                FlipResult fr = gpu_check(d_mem + vs, 256, victim_pat);
-                if (fr.count > 0) {
-                    stats.bitflips += fr.count;
-                    printf("\n  !!!! BIT FLIP (before aggr) – bank %d pos %d !!!!\n",
-                           bi, pos);
-                    printf("  Offset: 0x%lx  Expected: 0x%02X  Got: 0x%02X  "
-                           "XOR: 0x%02X\n",
-                           (unsigned long)(vs + fr.offset), fr.expected, fr.got,
-                           fr.expected ^ fr.got);
-                    gpu_fill(d_mem + vs, 256, victim_pat);
-                }
-            }
-
-            // Also check the row just after the last aggressor
-            if (agg_offs[n_sided - 1] + 512 <= mem_sz) {
-                size_t vs = agg_offs[n_sided - 1] + 256;
-                FlipResult fr = gpu_check(d_mem + vs, 256, victim_pat);
-                if (fr.count > 0) {
-                    stats.bitflips += fr.count;
-                    printf("\n  !!!! BIT FLIP (after aggr) – bank %d pos %d !!!!\n",
-                           bi, pos);
-                    printf("  Offset: 0x%lx  Expected: 0x%02X  Got: 0x%02X  "
-                           "XOR: 0x%02X\n",
-                           (unsigned long)(vs + fr.offset), fr.expected, fr.got,
-                           fr.expected ^ fr.got);
-                    gpu_fill(d_mem + vs, 256, victim_pat);
-                }
-            }
+            // Restore aggressor rows to victim pattern so the next
+            // iteration's check won't see stale aggressor data.
+            for (int i = 0; i < n_sided; i++)
+                CUDA_CHECK(cudaMemset(d_mem + agg_offs[i],
+                                      victim_pat, 256));
 
             if (!verbose && tested % 100 == 0) {
                 printf("\r  Bank %d: %d/%d positions (ECC:%d flips:%d)",
