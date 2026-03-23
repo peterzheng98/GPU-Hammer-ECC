@@ -2,7 +2,7 @@ NVCC       ?= nvcc
 CUDA_ARCH  ?= 80 90
 NVCCFLAGS   = -O2 -std=c++14 -Xcompiler -Wall
 NVCCFLAGS  += $(foreach a,$(CUDA_ARCH),-gencode arch=compute_$(a),code=sm_$(a))
-LDFLAGS     = -lnvidia-ml
+LDFLAGS     = -lnvidia-ml -lpthread
 
 TARGET = gpu_hammer
 SRC    = src/gpu_hammer.cu
