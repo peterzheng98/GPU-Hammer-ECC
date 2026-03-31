@@ -139,7 +139,7 @@ static MemoryProfile detect_memory_profile(const cudaDeviceProp &prop) {
               /*interleave*/ 256,
               /*tREFI*/ 3900, /*tRC*/ 46, /*tREFW*/ 32,
               /*on_die_ecc*/ true,
-              /*sync_delay*/ 500, /*rounds*/ 1, /*test_banks*/ 8,
+              /*sync_delay*/ 8, /*rounds*/ 64, /*test_banks*/ 16,
               /*stride_hint*/ 32768 };
     }
     // ---- HBM3: H100 / H800 ----
@@ -151,7 +151,7 @@ static MemoryProfile detect_memory_profile(const cudaDeviceProp &prop) {
               256,
               3900, 36, 32,
               true,
-              600, 1, 8,
+              8, 80, 16,
               65536 };
     }
     // ---- HBM3e: H200, B100, B200 ----
@@ -163,7 +163,7 @@ static MemoryProfile detect_memory_profile(const cudaDeviceProp &prop) {
               256,
               3900, 36, 32,
               true,
-              600, 1, 8,
+              8, 80, 16,
               65536 };
     }
     else if (strstr(name, "B100") || strstr(name, "B200") ||
@@ -175,7 +175,7 @@ static MemoryProfile detect_memory_profile(const cudaDeviceProp &prop) {
               256,
               3900, 36, 32,
               true,
-              600, 1, 12,
+              8, 80, 16,
               131072 };
     }
     // ---- GDDR6: A6000, RTX 30xx ----
@@ -189,7 +189,7 @@ static MemoryProfile detect_memory_profile(const cudaDeviceProp &prop) {
               256,
               1407, 45, 23,
               false,
-              200, 1, 4,
+              8, 48, 8,
               4096 };
     }
     // ---- GDDR6X: RTX 40xx, L40, A40 ----
@@ -203,7 +203,7 @@ static MemoryProfile detect_memory_profile(const cudaDeviceProp &prop) {
               256,
               1407, 45, 32,
               false,
-              200, 1, 4,
+              8, 48, 8,
               4096 };
     }
     // ---- Unknown – conservative defaults ----
@@ -216,7 +216,7 @@ static MemoryProfile detect_memory_profile(const cudaDeviceProp &prop) {
               256,
               3900, 46, 32,
               false,
-              300, 1, 4,
+              10, 32, 8,
               16384 };
     }
     return p;
@@ -248,9 +248,9 @@ static void print_memory_profile(const MemoryProfile &p, Logger &log, int gpu) {
 struct Config {
     std::vector<int> gpus;     // GPU IDs to test (empty = auto)
     bool all_gpus      = false;
-    int n_sided        = 24;
-    int distance       = 4;
-    int duration_ms    = 128;
+    int n_sided        = 32;
+    int distance       = 2;
+    int duration_ms    = 500;
     int k_warps        = 8;
     int m_threads      = 0;
     int rounds         = 0;       // 0 = auto from profile
@@ -263,7 +263,7 @@ struct Config {
     uint8_t victim     = 0xAA;
     uint8_t aggressor  = 0x55;
     size_t stride      = 0;
-    size_t reserve_mb  = 256;
+    size_t reserve_mb  = 128;
     int scan_samples   = 30;
     bool verbose       = false;
     std::string log_path;
@@ -276,9 +276,9 @@ static void usage(const char *prog) {
         "GPU:\n"
         "  --gpu ID|all|0,1,2   GPU selection (default: all)\n\n"
         "Hammering:\n"
-        "  --pattern N          N-sided aggressor pattern (default: 24)\n"
-        "  --distance D         Row distance between aggressors (default: 4)\n"
-        "  --duration MS        Hammer time per position in ms (default: 128)\n"
+        "  --pattern N          N-sided aggressor pattern (default: 32)\n"
+        "  --distance D         Row distance between aggressors (default: 2)\n"
+        "  --duration MS        Hammer time per position in ms (default: 500)\n"
         "  --warps K            Number of warps (default: 8)\n"
         "  --threads M          Threads per warp (0=auto, default: 0)\n"
         "  --rounds R           ACTs per sync window (0=auto)\n"
@@ -286,7 +286,7 @@ static void usage(const char *prog) {
         "Mapping:\n"
         "  --stride BYTES       Manual same-bank stride (0=auto)\n"
         "  --banks N            Banks to test (0=auto from memory type)\n"
-        "  --reserve MB         Memory to leave free in MB (default: 256)\n\n"
+        "  --reserve MB         Memory to leave free in MB (default: 128)\n\n"
         "Data:\n"
         "  --victim HEX         Victim byte pattern (default: 0xAA)\n"
         "  --aggressor HEX      Aggressor byte pattern (default: 0x55)\n\n"
@@ -428,9 +428,11 @@ struct ECCMon {
 
 static void log_ecc(Logger &log, int gpu, const ECCSnap &s) {
     if (!s.ok) { log.log(gpu, "  ECC: unavailable\n"); return; }
-    log.log(gpu, "  ECC vol  SBE=%llu DBE=%llu  "
-                 "agg SBE=%llu DBE=%llu  temp=%uC\n",
-            s.corr_vol, s.uncorr_vol, s.corr_agg, s.uncorr_agg, s.gpu_temp);
+    log.log(gpu, "  ECC volatile:  SBE=%llu  DBE=%llu\n",
+            s.corr_vol, s.uncorr_vol);
+    log.log(gpu, "  ECC aggregate: SBE=%llu  DBE=%llu\n",
+            s.corr_agg, s.uncorr_agg);
+    log.log(gpu, "  GPU temp: %uC\n", s.gpu_temp);
 }
 
 static void log_ecc_diff(Logger &log, int gpu,
@@ -439,8 +441,9 @@ static void log_ecc_diff(Logger &log, int gpu,
     long long dc = (long long)(b.corr_vol - a.corr_vol);
     long long du = (long long)(b.uncorr_vol - a.uncorr_vol);
     if (dc > 0 || du > 0)
-        log.log(gpu, "  >>> NEW ECC: +%lld correctable, "
-                     "+%lld uncorrectable <<<\n", dc, du);
+        log.log(gpu, "  >>> NEW ECC ERRORS <<<\n");
+    log.log(gpu, "  Correctable:   +%lld\n", dc);
+    log.log(gpu, "  Uncorrectable: +%lld\n", du);
 }
 
 // ===================================================================
@@ -491,11 +494,23 @@ __global__ void kern_fill(uint8_t *mem, size_t n, uint8_t val) {
     for (; i < n; i += s) mem[i] = val;
 }
 
-// Synchronized Rowhammer kernel (k-warp, m-thread-per-warp).
-// For HBM: the per-warp delay creates a bubble at the memory controller
-// aligned with tREFI. HBM's 3D structure means each pseudo-channel has
-// independent refresh; we concentrate all warps on one channel's bank
-// to maximize activation density within that channel.
+// Aggressive rowhammer kernel with double-sided ACT pattern and TRR bypass.
+//
+// HBM protection bypass techniques used here:
+//  1. Double-sided: each thread alternates loads between two different rows
+//     (a1, a2) in the same bank.  The MC must PRE one row to ACT the other,
+//     guaranteeing an ACT-PRE cycle on every single load instruction.
+//  2. High activation density: reduced sync_delay and high rounds count
+//     saturate the bank near the tRC physical limit (~84 ACTs/tREFI for
+//     HBM2e, ~108 for HBM3).
+//  3. TRR overflow: n_sided >= 32 activates more distinct rows than TRR's
+//     limited tracking table can hold, leaving some aggressor-adjacent
+//     victim rows un-refreshed.
+//  4. L2 eviction (discard.global.L2) + volatile loads bypass all GPU caches
+//     and force DRAM-level row activations.
+//  5. Multi-block launch (2 blocks on different SMs) creates cross-SM L2
+//     interference: one block's discard evicts the other block's cached data,
+//     increasing the L2 miss rate and thus DRAM ACT count.
 __global__ void kern_hammer(volatile uint8_t * const *addrs,
                             int k, int m, int rounds,
                             int sync_delay, uint64_t dur_ns) {
@@ -504,10 +519,15 @@ __global__ void kern_hammer(volatile uint8_t * const *addrs,
     int lid = threadIdx.x & 31;
     bool active = (wid < k && lid < m);
 
-    volatile uint8_t *a = nullptr;
+    volatile uint8_t *a1 = nullptr;
+    volatile uint8_t *a2 = nullptr;
     if (active) {
-        a = addrs[lid + wid * m];
-        asm volatile("discard.global.L2 [%0], 128;" :: "l"(a));
+        int base_idx = wid * m;
+        a1 = addrs[base_idx + lid];
+        a2 = (m > 1) ? addrs[base_idx + (lid + 1) % m]
+                      : addrs[((wid + 1) % k) * m];
+        asm volatile("discard.global.L2 [%0], 128;" :: "l"(a1));
+        asm volatile("discard.global.L2 [%0], 128;" :: "l"(a2));
     }
     __syncthreads();
     if (!active) return;
@@ -517,12 +537,15 @@ __global__ void kern_hammer(volatile uint8_t * const *addrs,
     uint64_t t_end = t_start + dur_ns;
 
     for (;;) {
-        for (int c = 0; c < 512; c++) {
+        for (int c = 0; c < 256; c++) {
             for (int r = 0; r < rounds; r++) {
-                asm volatile("discard.global.L2 [%0], 128;" :: "l"(a));
+                asm volatile("discard.global.L2 [%0], 128;" :: "l"(a1));
                 asm volatile("ld.u64.global.volatile %0, [%1];"
-                             : "=l"(d) : "l"(a));
-                __threadfence_block();
+                             : "=l"(d) : "l"(a1));
+                asm volatile("discard.global.L2 [%0], 128;" :: "l"(a2));
+                asm volatile("ld.u64.global.volatile %0, [%1];"
+                             : "=l"(d) : "l"(a2));
+                __threadfence();
             }
             for (int i = 0; i < sync_delay; i++)
                 ds += d;
@@ -719,7 +742,7 @@ static std::vector<BankMap> build_banks_timing(
                 if (h_lats[i] > thr) bm.rows.push_back(h_offs[i]);
             done += n;
             if (verbose && done % (BATCH * 20) == 0)
-                log.log(gpu, "\r    Scan %.1f%% – %zu conflicts",
+                log.log(gpu, "    Scan %.1f%% - %zu conflicts\n",
                         100.0 * done / total, bm.rows.size());
         }
         if (verbose)
@@ -745,18 +768,22 @@ struct SweepEntry {
 };
 
 static const SweepEntry SWEEP_TABLE[] = {
-    {24, 4, 0xAA, 0x55, "24-sided d4 AA/55"},
-    {24, 4, 0x55, 0xAA, "24-sided d4 55/AA"},
-    {20, 4, 0xAA, 0x55, "20-sided d4 AA/55"},
-    {20, 4, 0x55, 0xAA, "20-sided d4 55/AA"},
-    {16, 4, 0xAA, 0x55, "16-sided d4 AA/55"},
-    {12, 4, 0xAA, 0x55, "12-sided d4 AA/55"},
-    { 8, 4, 0xAA, 0x55, " 8-sided d4 AA/55"},
+    // Double-sided (d=2): victims sandwiched between aggressors
+    {32, 2, 0xAA, 0x55, "32-sided d2 AA/55"},
+    {32, 2, 0x55, 0xAA, "32-sided d2 55/AA"},
+    {32, 2, 0xFF, 0x00, "32-sided d2 FF/00"},
+    {32, 2, 0x00, 0xFF, "32-sided d2 00/FF"},
+    // High n_sided for TRR table overflow
+    {48, 2, 0xAA, 0x55, "48-sided d2 AA/55"},
+    {48, 2, 0x55, 0xAA, "48-sided d2 55/AA"},
+    {64, 2, 0xAA, 0x55, "64-sided d2 AA/55"},
+    // Distance 4: victims outside TRR refresh range
+    {32, 4, 0xAA, 0x55, "32-sided d4 AA/55"},
+    {32, 4, 0x55, 0xAA, "32-sided d4 55/AA"},
+    // Lower n_sided for denser per-row activation
     {24, 2, 0xAA, 0x55, "24-sided d2 AA/55"},
     {24, 2, 0x55, 0xAA, "24-sided d2 55/AA"},
-    {24, 4, 0x00, 0xFF, "24-sided d4 00/FF"},
-    {24, 4, 0xFF, 0x00, "24-sided d4 FF/00"},
-    {32, 4, 0xAA, 0x55, "32-sided d4 AA/55"},
+    {16, 2, 0xAA, 0x55, "16-sided d2 AA/55"},
 };
 static const int SWEEP_COUNT = sizeof(SWEEP_TABLE) / sizeof(SWEEP_TABLE[0]);
 
@@ -789,10 +816,13 @@ static void run_campaign(
         }
     }
 
-    log.log(gpu, "Campaign: %d-sided d=%d v=0x%02X a=0x%02X "
-                 "k=%d m=%d rnd=%d delay=%d dur=%dms\n",
-            n_sided, distance, victim_pat, aggr_pat,
-            k_warps, m_threads, rounds, sync_delay, duration_ms);
+    log.log(gpu, "Campaign config:\n");
+    log.log(gpu, "  Pattern:  %d-sided  distance=%d\n", n_sided, distance);
+    log.log(gpu, "  Data:     victim=0x%02X  aggressor=0x%02X\n",
+            victim_pat, aggr_pat);
+    log.log(gpu, "  Kernel:   warps=%d  threads/warp=%d  rounds=%d  sync_delay=%d\n",
+            k_warps, m_threads, rounds, sync_delay);
+    log.log(gpu, "  Duration: %d ms  (multi-block: 2)\n", duration_ms);
 
     ECCSnap ecc0 = ecc.snap();
 
@@ -848,7 +878,7 @@ static void run_campaign(
 
             int total_threads = k_warps * 32;
             if (total_threads > 1024) total_threads = 1024;
-            kern_hammer<<<1, total_threads>>>(
+            kern_hammer<<<2, total_threads>>>(
                     (volatile uint8_t *const *)d_addrs_raw,
                     k_warps, m_threads, rounds, sync_delay, dur_ns);
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -857,18 +887,19 @@ static void run_campaign(
 
             ECCSnap e1 = ecc.snap();
             if (ecc.has_new(e0, e1)) {
-                log.log(gpu, "  !!!! ECC ERROR – bank %d pos %d "
-                             "temp %uC !!!!\n", bi, pos, e1.gpu_temp);
+                log.log(gpu, "  !!!! ECC ERROR !!!!\n");
+                log.log(gpu, "  Bank %d  pos %d  temp %uC\n",
+                        bi, pos, e1.gpu_temp);
                 log_ecc_diff(log, gpu, e0, e1);
                 stats.ecc_events++;
             }
 
-            // Check victim rows in this bank adjacent to aggressors (±3)
+            // Check victim rows adjacent to aggressors
             {
                 int first_ri = pos;
                 int last_ri = pos + (n_sided - 1) * distance;
-                int lo = std::max(0, first_ri - 3);
-                int hi = std::min(nrows - 1, last_ri + 3);
+                int lo = std::max(0, first_ri - 6);
+                int hi = std::min(nrows - 1, last_ri + 6);
                 uint8_t buf[256];
 
                 for (int vi = lo; vi <= hi; vi++) {
@@ -885,11 +916,12 @@ static void run_campaign(
                     for (int b = 0; b < 256; b++) {
                         if (buf[b] != victim_pat) {
                             stats.bitflips++;
-                            log.log(gpu, "  !!!! BIT FLIP – bank %d "
-                                    "victim row %d !!!!\n", bi, vi);
-                            log.log(gpu, "  Offset 0x%lx byte %d: "
-                                    "0x%02X->0x%02X XOR 0x%02X\n",
-                                    (unsigned long)(voff+b), b,
+                            log.log(gpu, "  !!!! BIT FLIP !!!!\n");
+                            log.log(gpu, "  Bank %d  victim row %d\n",
+                                    bi, vi);
+                            log.log(gpu, "  Offset: 0x%lx  byte: %d\n",
+                                    (unsigned long)(voff+b), b);
+                            log.log(gpu, "  Value: 0x%02X -> 0x%02X  XOR: 0x%02X\n",
                                     victim_pat, buf[b],
                                     victim_pat ^ buf[b]);
                             CUDA_CHECK(cudaMemset(d_mem + voff,
@@ -904,7 +936,7 @@ static void run_campaign(
                 CUDA_CHECK(cudaMemset(d_mem + agg_offs[i], victim_pat, 256));
 
             if (!verbose && tested % 100 == 0) {
-                log.log(gpu, "\r  Bank %d: %d/%d pos (ECC:%d flips:%d)",
+                log.log(gpu, "  Bank %d: %d/%d pos (ECC:%d flips:%d)\n",
                         bi, tested, limit,
                         stats.ecc_events.load(), stats.bitflips.load());
             }
@@ -1088,14 +1120,14 @@ static void gpu_worker(int gpu_id, const Config &cfg,
             }
 
             double elapsed = now_sec() - t0;
-            log.log(gpu_id, "Run %d done in %.1f s "
-                    "(ECC:%d flips:%d)\n",
-                    result.runs, elapsed,
+            log.log(gpu_id, "Run %d done in %.1f s\n",
+                    result.runs, elapsed);
+            log.log(gpu_id, "  ECC events: %d  Bit flips: %d\n",
                     stats.ecc_events.load(), stats.bitflips.load());
 
             if (stats.ecc_events > 0 || stats.bitflips > 0) {
-                log.log(gpu_id, "*** ERRORS FOUND – re-running for "
-                        "reproducibility ***\n");
+                log.log(gpu_id, "*** ERRORS FOUND ***\n");
+                log.log(gpu_id, "Re-running for reproducibility...\n");
                 ECCSnap es = ecc.snap();
                 log_ecc(log, gpu_id, es);
             }
@@ -1202,8 +1234,9 @@ int main(int argc, char **argv) {
 
     int total_ecc = 0, total_flips = 0;
     for (auto &r : results) {
-        log.log(-1, "  GPU %d %-30s [%s]  runs=%d  ECC=%d  flips=%d\n",
-                r.gpu_id, r.gpu_name.c_str(), r.mem_type.c_str(),
+        log.log(-1, "  GPU %d: %s [%s]\n",
+                r.gpu_id, r.gpu_name.c_str(), r.mem_type.c_str());
+        log.log(-1, "    Runs: %d  ECC events: %d  Bit flips: %d\n",
                 r.runs, r.ecc_events, r.bitflips);
         total_ecc  += r.ecc_events;
         total_flips += r.bitflips;
