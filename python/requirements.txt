@@ -1,4 +1,3 @@
 torch>=2.3
-# Optional but strongly recommended for real FlashAttention-2 kernels:
-# flash-attn>=2.5
-# (install with: pip install flash-attn --no-build-isolation)
+flash-attn>=2.5
+# install with: pip install flash-attn --no-build-isolation
